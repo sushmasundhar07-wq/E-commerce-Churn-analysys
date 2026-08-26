@@ -1,0 +1,65 @@
+# 1. Database Connectivity & Data Manipulation
+from sqlalchemy import create_engine
+import pandas as pd
+import numpy as np
+
+#2. Data Visualization
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# 3. Statistical Analysis & Hypothesis Testing
+from scipy import stats
+from scipy.stats import chi2_contingency
+
+# 4. Machine Learning & Predictive Modeling
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix
+
+# 5. Global Notebook Settings
+import warnings
+warnings.filterwarnings('ignore')
+sns.set_theme(style="whitegrid")
+
+#ckecks environment
+import os
+
+# Check execution environment (Kaggle vs. Local)
+if os.path.exists('/kaggle/input'):
+    print("Kaggle Environment Detected")
+    
+    # 1. Create an In-Memory SQLite Database
+    engine = create_engine('sqlite://', echo=False)
+    
+    # 2. Read the uploaded CSV dataset (Path updated based on Kaggle dataset)
+    df = pd.read_csv('/kaggle/input/datasets/seiffathi/user-events/user_events.csv')
+    df.to_sql('user_events', engine, index=False)
+    
+    print("Data successfully loaded into the In-Memory SQLite database.")
+    
+else:
+    print("Local Environment Detected , You need to establish a connection")
+    
+    # Establish connection to the local database
+    # Update the connection string below to match your local SQL server credentials
+    # Local development only
+    # database_uri = "mysql+mysqlconnector://<USERNAME>:<PASSWORD>@localhost/<DATABASE>"
+    # engine = create_engine(database_uri)
+
+    #print("Connected to the Local Database successfully.")
+#OR run this to your ram
+# else:
+#     print("Local Environment Detected")
+    
+#     # Create an In-Memory SQLite Database for local execution
+#     engine = create_engine('sqlite://', echo=False)
+    
+#     # Read the local CSV file (Assuming user_events.csv is in the same folder)
+#     if os.path.exists('user_events.csv'):
+#         df_local = pd.read_csv('user_events.csv')
+#         df_local.to_sql('user_events', engine, index=False)
+#         print("Data successfully loaded from local CSV into In-Memory SQLite database.")
+#     else:
+#         print("Warning: 'user_events.csv' not found locally. Please configure your SQL engine.")
+#         # database_uri = "mysql+mysqlconnector://<USERNAME>:<PASSWORD>@localhost/<DATABASE>"
+#         # engine = create_engine(database_uri)
