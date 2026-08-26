@@ -1,0 +1,656 @@
+# Extract a quick preview of the raw dataset to understand the schema
+query_preview = """
+SELECT *
+FROM user_events
+LIMIT 5;
+"""
+df_preview = pd.read_sql(query_preview, engine)
+
+print("--- Raw Data Preview ---")
+display(df_preview)
+
+# Extract high-level metadata: volume, unique users, and date boundaries
+query_metadata = """
+SELECT 
+    COUNT(*) AS total_events,
+    COUNT(DISTINCT user_id) AS unique_users,
+    MIN(event_date) AS first_event_date,
+    MAX(event_date) AS last_event_date
+FROM user_events;
+"""
+df_metadata = pd.read_sql(query_metadata, engine)
+
+print("\n--- Database Metadata ---")
+display(df_metadata)
+
+# Retrieve the table schema directly from the database engine
+try:
+    # Standard SQL syntax for MySQL/PostgreSQL (Local Environment)
+    query_schema = "DESCRIBE user_events;"
+    df_schema = pd.read_sql(query_schema, engine)
+except:
+    # Fallback syntax for SQLite (Kaggle In-Memory Environment)
+    query_schema = "PRAGMA table_info(user_events);"
+    df_schema = pd.read_sql(query_schema, engine)
+
+print("--- Database Schema (Table Structure) ---")
+display(df_schema)
+
+# 1. Dynamically calculate the date threshold using Python to avoid SQL dialect conflicts (MySQL vs SQLite)
+query_max_date = "SELECT MAX(event_date) FROM user_events;"
+max_date = pd.to_datetime(pd.read_sql(query_max_date, engine).iloc[0, 0])
+start_date = max_date - pd.Timedelta(days=30)
+
+# 2. Execute SQL Conditional Aggregation
+query_funnel = f"""
+SELECT 
+    COUNT(DISTINCT CASE WHEN event_type = 'page_view' THEN user_id END) AS stage_1_views,
+    COUNT(DISTINCT CASE WHEN event_type = 'add_to_cart' THEN user_id END) AS stage_2_add_to_cart,
+    COUNT(DISTINCT CASE WHEN event_type = 'checkout_start' THEN user_id END) AS stage_3_checkout_start,
+    COUNT(DISTINCT CASE WHEN event_type = 'payment_info' THEN user_id END) AS stage_4_payment,
+    COUNT(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) AS stage_5_purchase
+FROM user_events
+WHERE event_date >= '{start_date.strftime('%Y-%m-%d %H:%M:%S')}';
+"""
+
+df_funnel = pd.read_sql(query_funnel, engine)
+print("--- 30-Day Conversion Funnel ---")
+display(df_funnel)
+
+# Execute SQL CTE to calculate conversion rates dynamically
+query_conversion_rates = f"""
+WITH FunnelCounts AS (
+    SELECT 
+        COUNT(DISTINCT CASE WHEN event_type = 'page_view' THEN user_id END) AS stage_1_views,
+        COUNT(DISTINCT CASE WHEN event_type = 'add_to_cart' THEN user_id END) AS stage_2_add_to_cart,
+        COUNT(DISTINCT CASE WHEN event_type = 'checkout_start' THEN user_id END) AS stage_3_checkout_start,
+        COUNT(DISTINCT CASE WHEN event_type = 'payment_info' THEN user_id END) AS stage_4_payment,
+        COUNT(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) AS stage_5_purchase
+    FROM user_events
+    WHERE event_date >= '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
+)
+SELECT 
+    ROUND((stage_2_add_to_cart * 100.0) / NULLIF(stage_1_views, 0), 2) AS view_to_cart_rate,
+    ROUND((stage_3_checkout_start * 100.0) / NULLIF(stage_2_add_to_cart, 0), 2) AS cart_to_checkout_rate,
+    ROUND((stage_4_payment * 100.0) / NULLIF(stage_3_checkout_start, 0), 2) AS checkout_to_payment_rate,
+    ROUND((stage_5_purchase * 100.0) / NULLIF(stage_4_payment, 0), 2) AS payment_to_purchase_rate,
+    ROUND((stage_5_purchase * 100.0) / NULLIF(stage_1_views, 0), 2) AS overall_conversion
+FROM FunnelCounts;
+"""
+
+df_conversion_report = pd.read_sql(query_conversion_rates, engine)
+
+print("--- Funnel Conversion Rates (%) ---")
+display(df_conversion_report)
+
+# Transpose the single-row dataframe and plot as a line chart with markers
+ax = df_conversion_report.T.plot(kind='line', marker='o', legend=False, figsize=(10, 5))
+
+# Add percentage labels to data points
+for x, y in enumerate(df_conversion_report.T.iloc[:, 0]):
+    ax.text(x, y + 2, f'{y}%', ha='center', va='bottom', fontsize=10, fontweight='bold', color='black')
+
+# Apply formatting: title, axis labels, and grid
+plt.title('Funnel Conversion Rates (%)', fontsize=14)
+plt.ylabel('Percentage (%)')
+plt.grid(True, linestyle='--', alpha=0.6)
+
+# Rotate x-axis labels slightly for better readability
+plt.xticks(rotation=10, ha='right')
+
+plt.show()
+# Execute SQL CTEs to generate the marketing performance matrix directly from the database
+query_marketing_matrix = f"""
+WITH ChannelStats AS (
+    SELECT 
+        traffic_source,
+        COUNT(DISTINCT user_id) AS users_count,
+        COUNT(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) AS purchases_count
+    FROM user_events
+    WHERE event_date >= '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
+    GROUP BY traffic_source
+),
+TotalUsers AS (
+    SELECT SUM(users_count) AS total_site_users FROM ChannelStats
+)
+SELECT 
+    c.traffic_source,
+    ROUND((c.users_count * 100.0) / t.total_site_users, 2) AS "traffic_volume_share_%",
+    ROUND(
+        ((c.users_count * 1.0 / t.total_site_users) * 5.0) + 
+        ((c.purchases_count * 1.0 / NULLIF(c.users_count, 0)) * 5.0), 
+    2) AS traffic_score_out_of_10,
+    ROUND((c.purchases_count * 100.0) / NULLIF(c.users_count, 0), 2) AS "buyers_from_this_channel_%"
+FROM ChannelStats c
+CROSS JOIN TotalUsers t
+ORDER BY traffic_score_out_of_10 DESC;
+"""
+
+df_marketing_matrix = pd.read_sql(query_marketing_matrix, engine)
+
+# Set traffic_source as index to perfectly match the pandas logic output
+df_marketing_matrix.set_index('traffic_source', inplace=True)
+
+print("--- Marketing Channel Performance  ---")
+display(df_marketing_matrix)
+
+# Set up the figure and axis
+fig, ax = plt.subplots(figsize=(10, 6))
+
+x = np.arange(len(df_marketing_matrix.index))
+width = 0.35
+
+# Plot Traffic Volume Share
+rects1 = ax.bar(x - width/2, df_marketing_matrix['traffic_volume_share_%'], width, label='Traffic Share (%)', color='#4C72B0')
+
+# Plot Conversion Rate
+rects2 = ax.bar(x + width/2, df_marketing_matrix['buyers_from_this_channel_%'], width, label='Conversion Rate (%)', color='#55A868')
+
+# Chart formatting
+ax.set_ylabel('Percentage (%)', fontsize=12)
+ax.set_title('Marketing Channels: Traffic Volume vs. Conversion Rate', fontsize=14, pad=15)
+ax.set_xticks(x)
+ax.set_xticklabels(df_marketing_matrix.index, fontsize=11)
+ax.legend()
+# Add grid
+plt.grid(axis='y', linestyle='--', alpha=0.6)
+plt.show()
+
+# Execute SQL CTEs to calculate stage-by-stage retention per traffic source
+query_channel_funnel = f"""
+WITH ChannelCounts AS (
+    SELECT 
+        traffic_source,
+        COUNT(DISTINCT CASE WHEN event_type = 'page_view' THEN user_id END) AS page_view,
+        COUNT(DISTINCT CASE WHEN event_type = 'add_to_cart' THEN user_id END) AS add_to_cart,
+        COUNT(DISTINCT CASE WHEN event_type = 'checkout_start' THEN user_id END) AS checkout_start,
+        COUNT(DISTINCT CASE WHEN event_type = 'payment_info' THEN user_id END) AS payment_info,
+        COUNT(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) AS purchase
+    FROM user_events
+    WHERE event_date >= '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
+    GROUP BY traffic_source
+),
+TotalViews AS (
+    SELECT SUM(page_view) AS total_site_views FROM ChannelCounts
+)
+SELECT 
+    c.traffic_source,
+    ROUND((c.page_view * 100.0) / t.total_site_views, 2) AS "traffic_share_%",
+    ROUND((c.add_to_cart * 100.0) / NULLIF(c.page_view, 0), 2) AS "page_to_add_%",
+    ROUND((c.checkout_start * 100.0) / NULLIF(c.add_to_cart, 0), 2) AS "add_to_checkout_%",
+    ROUND((c.payment_info * 100.0) / NULLIF(c.checkout_start, 0), 2) AS "checkout_to_payment_%",
+    ROUND((c.purchase * 100.0) / NULLIF(c.payment_info, 0), 2) AS "payment_to_purchase_%",
+    ROUND((c.purchase * 100.0) / NULLIF(c.page_view, 0), 2) AS "overall_buyers_rate_%"
+FROM ChannelCounts c
+CROSS JOIN TotalViews t
+ORDER BY "overall_buyers_rate_%" DESC;
+"""
+
+df_channel_funnel = pd.read_sql(query_channel_funnel, engine)
+df_channel_funnel.set_index('traffic_source', inplace=True)
+
+print("--- Channel-Specific Funnel Conversion Rates ---")
+display(df_channel_funnel)
+# Select only the conversion rate columns for the heatmap
+conversion_cols = ['page_to_add_%', 'add_to_checkout_%', 'checkout_to_payment_%', 'payment_to_purchase_%', 'overall_buyers_rate_%']
+heatmap_data = df_channel_funnel[conversion_cols]
+
+# Set up the figure
+plt.figure(figsize=(12, 6))
+
+# Plot the heatmap
+sns.heatmap(heatmap_data, annot=True, fmt=".2f", cmap="RdYlGn", center=50, linewidths=0.5, cbar_kws={'label': 'Conversion Rate (%)'})
+
+# Chart formatting
+plt.title('Stage-by-Stage Conversion Rates per Traffic Source', fontsize=14, pad=15)
+plt.ylabel('Traffic Source', fontsize=12)
+plt.xlabel('Funnel Stage', fontsize=12)
+plt.xticks(rotation=15)
+
+# Save high-res image
+plt.savefig('channel_funnel_heatmap.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# Execute SQL conditional aggregation to get raw unique user counts per funnel stage
+query_raw_funnel = f"""
+SELECT 
+    traffic_source,
+    COUNT(DISTINCT CASE WHEN event_type = 'page_view' THEN user_id END) AS total_views_users,
+    COUNT(DISTINCT CASE WHEN event_type = 'add_to_cart' THEN user_id END) AS added_to_cart_users,
+    COUNT(DISTINCT CASE WHEN event_type = 'checkout_start' THEN user_id END) AS started_checkout_users,
+    COUNT(DISTINCT CASE WHEN event_type = 'payment_info' THEN user_id END) AS entered_payment_users,
+    COUNT(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) AS completed_purchase_users
+FROM user_events
+WHERE event_date >= '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
+GROUP BY traffic_source
+ORDER BY total_views_users DESC;
+"""
+df_raw_funnel = pd.read_sql(query_raw_funnel, engine)
+
+# Set traffic_source as index to match the pandas dataframe format
+df_raw_funnel.set_index('traffic_source', inplace=True)
+
+print("--- Raw Funnel Users Volume per Channel ---")
+display(df_raw_funnel)
+
+# Transpose the dataframe so stages become rows for the x-axis
+df_raw_plot = df_raw_funnel.T
+
+# Set up the figure
+fig, ax = plt.subplots(figsize=(12, 6))
+
+# Plot a distinct line for each marketing channel
+for col in df_raw_plot.columns:
+    ax.plot(df_raw_plot.index, df_raw_plot[col], marker='o', linewidth=2, label=col.replace('_', ' ').title())
+
+# Chart formatting
+ax.set_title('Absolute User Volume Drop-off by Traffic Source', fontsize=14, pad=15)
+ax.set_ylabel('Number of Users', fontsize=12)
+ax.set_xlabel('Funnel Stage', fontsize=12)
+
+# Clean up x-axis labels for readability
+stage_labels = ['Total Views', 'Added to Cart', 'Started Checkout', 'Entered Payment', 'Completed Purchase']
+ax.set_xticks(range(len(stage_labels)))
+ax.set_xticklabels(stage_labels)
+
+ax.legend(title='Traffic Source')
+ax.grid(True, linestyle='--', alpha=0.6)
+
+plt.show()
+
+# Execute SQL CTEs to extract exactly the two metrics needed for the visualization, pre-sorted
+query_plot_data = f"""
+WITH BaseCounts AS (
+    SELECT 
+        traffic_source,
+        COUNT(DISTINCT CASE WHEN event_type = 'page_view' THEN user_id END) AS total_views,
+        COUNT(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) AS total_buyers
+    FROM user_events
+    WHERE event_date >= '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
+    GROUP BY traffic_source
+),
+SiteTotal AS (
+    SELECT SUM(total_views) AS total_site_views FROM BaseCounts
+)
+SELECT 
+    b.traffic_source,
+    ROUND((b.total_views * 100.0) / s.total_site_views, 2) AS "traffic_share_%",
+    ROUND((b.total_buyers * 100.0) / NULLIF(b.total_views, 0), 2) AS "overall_buyers_rate_%"
+FROM BaseCounts b
+CROSS JOIN SiteTotal s
+ORDER BY "overall_buyers_rate_%" ASC;
+"""
+plot_df = pd.read_sql(query_plot_data, engine)
+plot_df.set_index('traffic_source', inplace=True)
+
+# --- Visualization Code ---
+# 2. Setup figure
+fig, ax = plt.subplots(figsize=(8, 6))
+
+y = np.arange(len(plot_df.index))
+width = 0.35 
+
+# 3. Plot horizontal bars
+rects1 = ax.barh(y + width/2, plot_df['traffic_share_%'], width, label='Traffic Share(%)', color='#3498db')
+rects2 = ax.barh(y - width/2, plot_df['overall_buyers_rate_%'], width, label='Conversion Rate(%)', color='#2ecc71')
+
+# 4. Formatting
+ax.set_title('Marketing Channels: Volume vs. Efficiency', fontsize=16, pad=20, fontweight='bold', color='#2c3e50')
+ax.set_xlabel('Percentage (%)', fontsize=12)
+ax.set_yticks(y)
+ax.set_yticklabels(plot_df.index, fontsize=12, fontweight='bold')
+ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=2, fontsize=11)
+ax.grid(axis='x', linestyle='--', alpha=0.5)
+
+# 5. Add exact value labels on the bars
+for rect in rects1:
+    width_val = rect.get_width()
+    ax.text(width_val + 0.5, rect.get_y() + rect.get_height()/2, f'{width_val}%', 
+            ha='left', va='center', fontsize=10, fontweight='bold', color='#2c3e50')
+
+for rect in rects2:
+    width_val = rect.get_width()
+    ax.text(width_val + 0.5, rect.get_y() + rect.get_height()/2, f'{width_val}%', 
+            ha='left', va='center', fontsize=10, fontweight='bold', color='#27ae60')
+
+# 6. Final layout
+plt.tight_layout()
+
+plt.show()
+
+# 1. SQL Query for Day of Week Analysis (MySQL Native Functions)
+query_day_performance = f"""
+SELECT 
+    WEEKDAY(event_date) AS day_num, -- 0=Monday, 1=Tuesday... 6=Sunday
+    CASE WEEKDAY(event_date)
+        WHEN 0 THEN 'Monday'
+        WHEN 1 THEN 'Tuesday'
+        WHEN 2 THEN 'Wednesday'
+        WHEN 3 THEN 'Thursday'
+        WHEN 4 THEN 'Friday'
+        WHEN 5 THEN 'Saturday'
+        WHEN 6 THEN 'Sunday'
+    END AS day_of_week,
+    COUNT(DISTINCT CASE WHEN event_type = 'page_view' THEN user_id END) AS total_views,
+    COUNT(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) AS total_purchases,
+    ROUND((COUNT(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) * 100.0) / 
+          NULLIF(COUNT(DISTINCT CASE WHEN event_type = 'page_view' THEN user_id END), 0), 2) AS `conversion_rate_%`
+FROM user_events
+WHERE event_date >= '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
+GROUP BY day_num, day_of_week
+ORDER BY `conversion_rate_%` DESC;
+# 2. SQL Query for Hour of Day Analysis (MySQL Native Functions)
+query_hour_performance = f"""
+SELECT 
+    HOUR(event_date) AS hour_of_day, -- Extracts 0 to 23
+    COUNT(DISTINCT CASE WHEN event_type = 'page_view' THEN user_id END) AS total_views,
+    COUNT(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) AS total_purchases,
+    ROUND((COUNT(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) * 100.0) / 
+          NULLIF(COUNT(DISTINCT CASE WHEN event_type = 'page_view' THEN user_id END), 0), 2) AS `conversion_rate_%`
+FROM user_events
+WHERE event_date >= '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
+GROUP BY hour_of_day
+ORDER BY `conversion_rate_%` DESC;
+"""
+
+# Fetch the DataFrames
+df_day_report = pd.read_sql(query_day_performance, engine).set_index('day_of_week').drop(columns=['day_num'])
+df_hour_report = pd.read_sql(query_hour_performance, engine).set_index('hour_of_day')
+
+print("=== Day of Week Performance ===")
+display(df_day_report)
+
+print("\n=== Hour of Day Performance ===")
+display(df_hour_report)
+# -- 1. Day of Week Visualization --
+# Reordering chronologically for a logical timeline plot
+days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+df_day_plot = df_day_report.reindex(days_order)
+
+plt.figure(figsize=(10, 4))
+plt.plot(df_day_plot.index, df_day_plot['conversion_rate_%'], marker='o', color='#1abc9c', linewidth=2)
+plt.title('Conversion Rate Trend by Day of Week', fontsize=14, fontweight='bold')
+plt.ylabel('Conversion Rate (%)')
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.savefig('day_conversion_trend.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# -- 2. Hour of Day Visualization --
+# Sorting by hour chronologically (0 to 23) for the plot
+df_hour_plot = df_hour_report.sort_index()
+
+plt.figure(figsize=(12, 4))
+plt.plot(df_hour_plot.index, df_hour_plot['conversion_rate_%'], marker='o', color='#34495e', linewidth=2)
+plt.title('Conversion Rate Trend by Hour of Day', fontsize=14, fontweight='bold')
+plt.xlabel('Hour of Day (24h)')
+plt.ylabel('Conversion Rate (%)')
+plt.xticks(range(0, 24))
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.savefig('hour_conversion_trend.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# 1. SQL Query for Detailed Funnel by Day of Week
+query_day_funnel = f"""
+WITH DayCounts AS (
+    SELECT 
+        WEEKDAY(event_date) AS day_num,
+        CASE WEEKDAY(event_date)
+            WHEN 0 THEN 'Monday' WHEN 1 THEN 'Tuesday' WHEN 2 THEN 'Wednesday'
+            WHEN 3 THEN 'Thursday' WHEN 4 THEN 'Friday' WHEN 5 THEN 'Saturday'
+            WHEN 6 THEN 'Sunday'
+        END AS day_of_week,
+        COUNT(DISTINCT CASE WHEN event_type = 'page_view' THEN user_id END) AS page_view,
+        COUNT(DISTINCT CASE WHEN event_type = 'add_to_cart' THEN user_id END) AS add_to_cart,
+        COUNT(DISTINCT CASE WHEN event_type = 'checkout_start' THEN user_id END) AS checkout_start,
+        COUNT(DISTINCT CASE WHEN event_type = 'payment_info' THEN user_id END) AS payment_info,
+        COUNT(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) AS purchase
+    FROM user_events
+    WHERE event_date >= '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
+    GROUP BY day_num, day_of_week
+)
+SELECT 
+    day_of_week,
+    ROUND((add_to_cart * 100.0) / NULLIF(page_view, 0), 2) AS `view_to_cart_%`,
+    ROUND((checkout_start * 100.0) / NULLIF(add_to_cart, 0), 2) AS `cart_to_checkout_%`,
+    ROUND((payment_info * 100.0) / NULLIF(checkout_start, 0), 2) AS `checkout_to_payment_%`,
+    ROUND((purchase * 100.0) / NULLIF(payment_info, 0), 2) AS `payment_to_purchase_%`,
+    ROUND((purchase * 100.0) / NULLIF(page_view, 0), 2) AS `overall_conversion_%`
+FROM DayCounts
+ORDER BY `overall_conversion_%` DESC;
+"""
+
+# 2. SQL Query for Detailed Funnel by Hour of Day
+query_hour_funnel = f"""
+WITH HourCounts AS (
+    SELECT 
+        HOUR(event_date) AS hour_of_day,
+        COUNT(DISTINCT CASE WHEN event_type = 'page_view' THEN user_id END) AS page_view,
+        COUNT(DISTINCT CASE WHEN event_type = 'add_to_cart' THEN user_id END) AS add_to_cart,
+        COUNT(DISTINCT CASE WHEN event_type = 'checkout_start' THEN user_id END) AS checkout_start,
+        COUNT(DISTINCT CASE WHEN event_type = 'payment_info' THEN user_id END) AS payment_info,
+        COUNT(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) AS purchase
+    FROM user_events
+    WHERE event_date >= '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
+    GROUP BY hour_of_day
+)
+SELECT 
+    hour_of_day,
+    ROUND((add_to_cart * 100.0) / NULLIF(page_view, 0), 2) AS `view_to_cart_%`,
+    ROUND((checkout_start * 100.0) / NULLIF(add_to_cart, 0), 2) AS `cart_to_checkout_%`,
+    ROUND((payment_info * 100.0) / NULLIF(checkout_start, 0), 2) AS `checkout_to_payment_%`,
+    ROUND((purchase * 100.0) / NULLIF(payment_info, 0), 2) AS `payment_to_purchase_%`,
+    ROUND((purchase * 100.0) / NULLIF(page_view, 0), 2) AS `overall_conversion_%`
+FROM HourCounts
+ORDER BY `overall_conversion_%` DESC;
+"""
+
+# Fetch the DataFrames
+df_day_funnel = pd.read_sql(query_day_funnel, engine).set_index('day_of_week')
+df_hour_funnel = pd.read_sql(query_hour_funnel, engine).set_index('hour_of_day')
+
+print("=== Day of Week Funnel Performance ===")
+display(df_day_funnel)
+
+print("\n=== Hour of Day Funnel Performance ===")
+display(df_hour_funnel)
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# -- 1. Day of Week Funnel Heatmap --
+days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+df_day_funnel_plot = df_day_funnel.reindex(days_order)
+
+plt.figure(figsize=(12, 5))
+sns.heatmap(df_day_funnel_plot, annot=True, fmt=".2f", cmap="YlGnBu", cbar=False)
+plt.title('Stage Conversion Rates by Day of the Week (%)', fontsize=14, fontweight='bold', pad=15)
+plt.ylabel('Day of Week')
+plt.savefig('day_funnel_heatmap.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# -- 2. Hour of Day Funnel Heatmap --
+# Sorting hours chronologically for correct transition
+df_hour_funnel_plot = df_hour_funnel.sort_index()
+
+plt.figure(figsize=(14, 8))
+sns.heatmap(df_hour_funnel_plot, annot=True, fmt=".2f", cmap="YlGnBu", cbar=False)
+plt.title('Stage Conversion Rates by Hour of the Day (%)', fontsize=14, fontweight='bold', pad=15)
+plt.ylabel('Hour of Day (24h)')
+plt.savefig('hour_funnel_heatmap.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+query = f"""
+WITH user_journey AS (
+    SELECT 
+        user_id,
+        MIN(CASE WHEN event_type = 'page_view' THEN event_date END) AS views_time,
+        MIN(CASE WHEN event_type = 'add_to_cart' THEN event_date END) AS carts_time,
+        MIN(CASE WHEN event_type = 'checkout_start' THEN event_date END) AS checkout_time,
+        MIN(CASE WHEN event_type = 'payment_info' THEN event_date END) AS payment_time,
+        MIN(CASE WHEN event_type = 'purchase' THEN event_date END) AS purchases_time
+    FROM 
+        user_events
+    WHERE event_date >= '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
+    GROUP BY 
+        user_id
+    HAVING MIN(CASE WHEN event_type = 'purchase' THEN event_date END) IS NOT NULL
+)
+
+SELECT 
+    COUNT(*) AS Purchasers,
+    ROUND(AVG(TIMESTAMPDIFF(MINUTE, views_time, carts_time)), 2) AS AVG_view_to_cart_minutes,
+    ROUND(AVG(TIMESTAMPDIFF(MINUTE, carts_time , checkout_time)), 2) AS AVG_cart_to_checkout_minutes,
+    ROUND(AVG(TIMESTAMPDIFF(MINUTE, checkout_time , payment_time)), 2) AS AVG_checkout_to_payment_minutes,
+    ROUND(AVG(TIMESTAMPDIFF(MINUTE, payment_time , purchases_time)), 2) AS AVG_payment_to_purchasing_minutes
+    
+    
+FROM 
+    user_journey;
+"""
+
+journey_df = pd.read_sql(query, engine)
+
+journey_df.tail()
+
+velocity_data = journey_df.drop(columns=['Purchasers']).melt(
+    var_name='Funnel_Step', 
+    value_name='Avg_Minutes'
+)
+
+velocity_data['Funnel_Step'] = velocity_data['Funnel_Step'].str.replace('AVG_', '').str.replace('_minutes', '').str.replace('_', ' ')
+
+velocity_data
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# Set up the figure
+plt.figure(figsize=(10, 5))
+
+# Plot horizontal bars for better readability of stage names
+ax = sns.barplot(
+    x='Avg_Minutes', 
+    y='Funnel_Step', 
+    data=velocity_data, 
+    palette='Blues_r' # Colors fade as time decreases
+)
+
+# Add exact minutrage Duration (Minutes)', fontsize=12)
+plt.ylabel('Funnel Transition', fontsize=12)
+plt.grid(axis='x', linestyle='--', alpha=0.5)
+
+# Save high-res image
+plt.tight_layout()
+plt.savefig('user_velocity_friction.png', dpi=300)
+plt.show()es on top of each bar
+for container in ax.containers:
+    ax.bar_label(container, fmt='%.2f min', padding=5, fontweight='bold', color='#2c3e50')
+
+# Chart formatting
+plt.title('User Velocity: Average Time Spent Between Funnel Stages', fontsize=14, fontweight='bold', pad=15)
+plt.xlabel('Average Duration (Minutes)', fontsize=12)
+plt.ylabel('Funnel Transition', fontsize=12)
+plt.grid(axis='x', linestyle='--', alpha=0.5)
+
+# Save high-res image
+plt.tight_layout()
+plt.savefig('user_velocity_friction.png', dpi=300)
+plt.show()
+
+query_rev = f""" 
+SELECT 
+    SUM(amount) AS total_revenue,
+    
+    COUNT(DISTINCT event_id) AS total_orders,
+    
+    ROUND(AVG(amount), 2) AS average_order_value,
+    
+    COUNT(DISTINCT user_id) AS unique_buyers
+FROM 
+    user_events
+WHERE 
+    event_type = 'purchase'
+   AND event_date >= '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
+"""
+
+rev_df = pd.read_sql(query_rev , engine)
+
+rev_df.tail()
+
+query_rev_by_channel = f""" 
+SELECT 
+    traffic_source,
+    SUM(amount) AS total_revenue,
+    COUNT(DISTINCT event_id) AS total_orders,
+    ROUND(SUM(amount) / COUNT(DISTINCT event_id), 2) AS AOV
+FROM 
+    user_events
+WHERE 
+    event_type = 'purchase'
+    AND event_date >= '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
+GROUP BY 
+    traffic_source
+ORDER BY 
+    total_revenue DESC;
+"""
+
+rev_df = pd.read_sql(query_rev_by_channel, engine)
+
+total_rev = rev_df['total_revenue'].sum()
+total_ords = rev_df['total_orders'].sum()
+total_aov = round(total_rev / total_ords, 2)
+
+total_row = pd.DataFrame([{
+    'traffic_source': 'Total',
+    'total_revenue': total_rev,
+    'total_orders': total_ords,
+    'AOV': total_aov
+}])
+
+revenue_report = pd.concat([rev_df, total_row], ignore_index=True)
+revenue_report = revenue_report.rename(columns={
+    'total_revenue': 'total_revenue ($)',
+    'AOV': 'AOV ($)'
+})
+
+print("--- Financial Revenue Report by Channel ---")
+display(revenue_report)
+
+# 2. Set up side-by-side subplots
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+
+# Plot 1: Total Revenue Volume (Excluding Total row using .drop(4))
+sns.barplot(x='traffic_source', y='total_revenue ($)', data=revenue_report.drop(4), palette='Blues_r', ax=ax1, hue='traffic_source')
+ax1.set_title('Total Revenue Generation by Channel', fontsize=13, fontweight='bold', pad=15)
+ax1.set_xlabel('Traffic Source', fontsize=11)
+ax1.set_ylabel('Total Revenue ($)', fontsize=11)
+ax1.grid(axis='y', linestyle='--', alpha=0.5)
+if ax1.get_legend() is not None:
+    ax1.get_legend().remove()
+
+# Add data labels for Plot 1
+for p in ax1.patches:
+    height = p.get_height()
+    if height > 0:
+        ax1.annotate(f"${height:,.2f}", (p.get_x() + p.get_width() / 2., height),
+                     ha='center', va='center', xytext=(0, 8), textcoords='offset points', fontsize=10, fontweight='bold')
+# Plot 2: Average Order Value (AOV) (Excluding Total row using .drop(4) and sorted)
+revenue_sorted = revenue_report.drop(4).sort_values(by='AOV ($)', ascending=False)
+sns.barplot(x='traffic_source', y='AOV ($)', data=revenue_sorted, palette='Greens_r', ax=ax2, hue='traffic_source')
+ax2.set_title('Average Order Value (AOV) Comparison', fontsize=13, fontweight='bold', pad=15)
+ax2.set_xlabel('Traffic Source', fontsize=11)
+ax2.set_ylabel('AOV ($)', fontsize=11)
+ax2.grid(axis='y', linestyle='--', alpha=0.5)
+if ax2.get_legend() is not None:
+    ax2.get_legend().remove()
+
+# Add data labels for Plot 2
+for p in ax2.patches:
+    height = p.get_height()
+    if height > 0:
+        ax2.annotate(f"${height:,.2f}", (p.get_x() + p.get_width() / 2., height),
+                     ha='center', va='center', xytext=(0, 8), textcoords='offset points', fontsize=10, fontweight='bold')
+
+plt.tight_layout()
+plt.savefig('revenue_vs_aov_analysis.png', dpi=300)
+Financial Funnel & Revenue Metrics Analysis (Last 30 Days)
